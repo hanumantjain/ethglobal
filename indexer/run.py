@@ -7,14 +7,20 @@ from web3 import AsyncWeb3
 from web3.providers.async_rpc import AsyncHTTPProvider
 from web3.types import HexBytes
 
+import json, time
+from typing import List, Dict, Any
+
 # ----------------------- load .env -----------------------
 load_dotenv(".env")  # always load from local file
 
-RPC_URL         = os.getenv("RPC_URL")
-CONFIRMS        = int(os.getenv("CONFIRMS", "6"))
-BACKFILL_BLOCKS = int(os.getenv("BACKFILL_BLOCKS", "5000"))
-RECEIPT_CONC    = int(os.getenv("RECEIPT_CONC", "20"))
-DB_PATH         = os.getenv("DB_PATH", "katana_index.sqlite")
+RPC_URL              = os.getenv("RPC_URL")
+CONFIRMS             = int(os.getenv("CONFIRMS", "6"))
+BACKFILL_BLOCKS      = int(os.getenv("BACKFILL_BLOCKS", "5000"))
+RECEIPT_CONC         = int(os.getenv("RECEIPT_CONC", "20"))
+DB_PATH              = os.getenv("DB_PATH", "katana_index.sqlite")
+METRIC_WINDOW        = int(os.getenv("METRIC_WINDOW", "200"))
+TOP_K                = int(os.getenv("TOP_K", "10"))
+METRICS_EVERY_BLOCKS = int(os.getenv("METRICS_EVERY_BLOCKS", "1000"))
 
 if not RPC_URL:
     raise SystemExit("Missing RPC_URL in .env")
@@ -33,7 +39,24 @@ def ensure_schema(conn: sqlite3.Connection):
         k TEXT PRIMARY KEY,
         v TEXT
     );
-
+                       
+    CREATE TABLE IF NOT EXISTS metrics_snapshot (
+        id INTEGER PRIMARY KEY CHECK (id=1),
+        computed_at          INTEGER NOT NULL,
+        window_n_blocks      INTEGER NOT NULL,
+        from_block           INTEGER NOT NULL,
+        to_block             INTEGER NOT NULL,
+        avg_block_time_s     REAL,
+        tps                  REAL,
+        gas_utilization_avg  REAL,
+        base_fee_wei_avg     TEXT,
+        base_fee_wei_p50     TEXT,
+        tx_success           INTEGER,
+        tx_failed            INTEGER,
+        top_senders_json     TEXT,
+        top_receivers_json   TEXT
+    );
+                       
     CREATE TABLE IF NOT EXISTS blocks (
         number                INTEGER PRIMARY KEY,
         hash                  TEXT NOT NULL,
@@ -91,6 +114,23 @@ def to_addr(x):
     if x is None: return None
     return AsyncWeb3.to_checksum_address(x)
 
+def hex_to_int(x):
+    if x is None: return None
+    if isinstance(x, int): return x
+    if isinstance(x, bytes): return int.from_bytes(x, "big")
+    s = str(x)
+    return int(s, 16) if s.startswith("0x") else int(s)
+
+def upsert_metrics_snapshot(conn, payload: Dict[str, Any]):
+    cols = ",".join(payload.keys())
+    qmarks = ",".join(["?"] * len(payload))
+    conn.execute(f"""
+        INSERT INTO metrics_snapshot (id,{cols})
+        VALUES (1,{qmarks})
+        ON CONFLICT(id) DO UPDATE SET
+        {", ".join([f"{k}=excluded.{k}" for k in payload.keys()])}
+    """, tuple(payload.values()))
+
 # ----------------------- core indexer -----------------------
 async def fetch_block(w3, num):
     return await w3.eth.get_block(block_identifier=num, full_transactions=True)
@@ -98,14 +138,25 @@ async def fetch_block(w3, num):
 async def fetch_receipt(w3, tx_hash):
     return await w3.eth.get_transaction_receipt(tx_hash)
 
-async def index_range(conn, w3, start, end):
-    for n in range(start, end + 1):
-        b = await fetch_block(w3, n)
 
-        # insert block
+async def index_range(conn, w3, start, end):
+    """
+    Index blocks [start, end] inclusive.
+    Also computes rolling network metrics every `METRICS_EVERY_BLOCKS` blocks,
+    so you'll see metrics populate during long backfills.
+    """
+    blocks_since_metrics = 0
+
+    for n in range(start, end + 1):
+        # ---- fetch block (with full txs) ----
+        b = await w3.eth.get_block(block_identifier=n, full_transactions=True)
+
+        # ---- insert block ----
         conn.execute("""
-        INSERT OR IGNORE INTO blocks(number, hash, parent_hash, timestamp, gas_limit, gas_used, base_fee_per_gas_wei, miner, tx_count)
-        VALUES(?,?,?,?,?,?,?,?,?)
+        INSERT OR IGNORE INTO blocks(
+            number, hash, parent_hash, timestamp, gas_limit, gas_used,
+            base_fee_per_gas_wei, miner, tx_count
+        ) VALUES(?,?,?,?,?,?,?,?,?)
         """, (
             b["number"],
             b["hash"].hex(),
@@ -118,18 +169,22 @@ async def index_range(conn, w3, start, end):
             len(b["transactions"])
         ))
 
-        # receipts in parallel
+        # ---- fetch receipts in parallel (bounded) ----
         sem = asyncio.Semaphore(RECEIPT_CONC)
+
         async def rec_task(tx):
             async with sem:
                 try:
-                    return tx, await fetch_receipt(w3, tx["hash"])
-                except:
-                    return tx, None
+                    rec = await w3.eth.get_transaction_receipt(tx["hash"])
+                except Exception:
+                    rec = None  # receipts can lag; we'll backfill on future passes
+                return tx, rec
 
-        rec_pairs = await asyncio.gather(*[rec_task(tx) for tx in b["transactions"]])
+        rec_pairs = await asyncio.gather(
+            *[rec_task(tx) for tx in b["transactions"]]
+        )
 
-        # insert txs
+        # ---- insert txs ----
         for tx, rec in rec_pairs:
             conn.execute("""
             INSERT OR IGNORE INTO txs(
@@ -155,8 +210,129 @@ async def index_range(conn, w3, start, end):
                 (to_addr(rec.get("contractAddress")) if rec else None)
             ))
 
+        # ---- update progress + meta ----
         set_meta(conn, "last_safe_block", str(n))
+        blocks_since_metrics += 1
+
+        # ---- periodic metrics snapshot ----
+        if blocks_since_metrics >= METRICS_EVERY_BLOCKS:
+            try:
+                compute_metrics(conn, METRIC_WINDOW, TOP_K)
+                print(f"[metrics] snapshot @ block {n} (window={METRIC_WINDOW})")
+            except Exception as e:
+                print(f"[metrics] compute failed @ block {n}: {e}")
+            finally:
+                blocks_since_metrics = 0
+
+        # optional: log every block (or throttle if too noisy)
         print(f"Indexed block {n} (txs {len(b['transactions'])})")
+
+    # ---- final snapshot for the tail of this range ----
+    if blocks_since_metrics > 0:
+        try:
+            compute_metrics(conn, METRIC_WINDOW, TOP_K)
+            print(f"[metrics] final snapshot @ block {end} (window={METRIC_WINDOW})")
+        except Exception as e:
+            print(f"[metrics] final compute failed @ block {end}: {e}")
+
+
+def compute_metrics(conn, window_blocks: int = 200, top_k: int = 10):
+    # find range
+    to_block = conn.execute("SELECT MAX(number) FROM blocks").fetchone()[0]
+    if to_block is None:
+        return
+    from_block = max(0, to_block - window_blocks + 1)
+
+    # fetch recent blocks (ordered)
+    rows = conn.execute("""
+        SELECT number, timestamp, gas_limit, gas_used, base_fee_per_gas_wei, tx_count
+        FROM blocks
+        WHERE number BETWEEN ? AND ?
+        ORDER BY number ASC
+    """, (from_block, to_block)).fetchall()
+
+    if len(rows) < 2:
+        return  # need at least 2 to compute deltas
+
+    # block times & aggregates
+    deltas = []
+    tot_txs = 0
+    gas_util_vals = []
+    base_fees = []
+
+    prev_ts = rows[0][1]
+    for (num, ts, gas_limit, gas_used, base_fee, tx_count) in rows:
+        # delta to previous
+        dt = max(0, ts - prev_ts)
+        if dt > 0:
+            deltas.append(dt)
+        prev_ts = ts
+
+        tot_txs += int(tx_count or 0)
+
+        gl = hex_to_int(gas_limit) if gas_limit is not None else None
+        gu = hex_to_int(gas_used) if gas_used is not None else None
+        if gl and gu is not None and gl > 0:
+            gas_util_vals.append(gu / float(gl))
+
+        if base_fee is not None:
+            base_fees.append(hex_to_int(base_fee))
+
+    avg_block_time = (sum(deltas) / len(deltas)) if deltas else None
+    tps = (tot_txs / sum(deltas)) if deltas and sum(deltas) > 0 else None
+    gas_util_avg = (sum(gas_util_vals) / len(gas_util_vals)) if gas_util_vals else None
+
+    base_fee_avg = str(int(sum(base_fees) / len(base_fees))) if base_fees else None
+    base_fee_p50 = None
+    if base_fees:
+        bfs = sorted(base_fees)
+        base_fee_p50 = str(bfs[len(bfs)//2])
+
+    # tx status (success/failed) in the same window
+    tx_ok = conn.execute("""
+        SELECT COUNT(*) FROM txs
+        WHERE block_number BETWEEN ? AND ? AND status=1
+    """, (from_block, to_block)).fetchone()[0]
+    tx_fail = conn.execute("""
+        SELECT COUNT(*) FROM txs
+        WHERE block_number BETWEEN ? AND ? AND status=0
+    """, (from_block, to_block)).fetchone()[0]
+
+    # top senders / receivers by tx count
+    top_senders = conn.execute(f"""
+        SELECT "from" AS addr, COUNT(*) AS cnt
+        FROM txs
+        WHERE block_number BETWEEN ? AND ?
+        GROUP BY "from"
+        ORDER BY cnt DESC
+        LIMIT ?
+    """, (from_block, to_block, top_k)).fetchall()
+    top_receivers = conn.execute(f"""
+        SELECT "to" AS addr, COUNT(*) AS cnt
+        FROM txs
+        WHERE block_number BETWEEN ? AND ? AND "to" IS NOT NULL
+        GROUP BY "to"
+        ORDER BY cnt DESC
+        LIMIT ?
+    """, (from_block, to_block, top_k)).fetchall()
+
+    payload = {
+        "computed_at": int(time.time()),
+        "window_n_blocks": int(window_blocks),
+        "from_block": int(from_block),
+        "to_block": int(to_block),
+        "avg_block_time_s": float(avg_block_time) if avg_block_time is not None else None,
+        "tps": float(tps) if tps is not None else None,
+        "gas_utilization_avg": float(gas_util_avg) if gas_util_avg is not None else None,
+        "base_fee_wei_avg": base_fee_avg,
+        "base_fee_wei_p50": base_fee_p50,
+        "tx_success": int(tx_ok or 0),
+        "tx_failed": int(tx_fail or 0),
+        "top_senders_json": json.dumps([{"address": r[0], "count": r[1]} for r in top_senders]),
+        "top_receivers_json": json.dumps([{"address": r[0], "count": r[1]} for r in top_receivers]),
+    }
+    upsert_metrics_snapshot(conn, payload)
+
 
 async def main():
     w3 = AsyncWeb3(AsyncHTTPProvider(RPC_URL))
@@ -181,6 +357,7 @@ async def main():
             start_from = safe + 1
         else:
             await asyncio.sleep(1.0)
+    
 
 if __name__ == "__main__":
     uvloop.run(main())

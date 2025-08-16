@@ -4,6 +4,7 @@ from typing import List, Dict, Any, Optional
 from dotenv import load_dotenv
 from fastmcp import FastMCP
 from pydantic import BaseModel, Field
+import json
 
 load_dotenv(".env")
 DB_PATH = os.getenv("DB_PATH", "katana_index.sqlite")
@@ -106,6 +107,119 @@ def tx_by_hash(value: dict | str):
     if not row:
         return {"error": f"tx {h} not found"}
     return row_to_dict(row)
+
+@mcp.tool()
+def health(value: dict | None = None):
+    """
+    Return indexer + metrics health. Reads the latest row from metrics_snapshot (id=1)
+    and basic counts from blocks/txs.
+    """
+    # basic counts
+    blk = db.execute("SELECT COUNT(*) AS n, MAX(number) AS maxn FROM blocks").fetchone()
+    txs = db.execute("SELECT COUNT(*) AS n, MAX(block_number) AS maxt FROM txs").fetchone()
+
+    # metrics snapshot (single row with id=1)
+    ms = db.execute("SELECT * FROM metrics_snapshot WHERE id=1").fetchone()
+    out: Dict[str, Any] = {
+        "db_path": DB_PATH,
+        "blocks": {"count": blk["n"], "max_number": blk["maxn"]},
+        "txs": {"count": txs["n"], "max_block_number": txs["maxt"]},
+        "metrics": None,
+        "ready": False,
+    }
+
+    if ms:
+        ms_dict = {k: ms[k] for k in ms.keys()}
+        # expand JSON fields if present
+        if ms_dict.get("top_senders_json"):
+            ms_dict["top_senders"] = json.loads(ms_dict.pop("top_senders_json"))
+        if ms_dict.get("top_receivers_json"):
+            ms_dict["top_receivers"] = json.loads(ms_dict.pop("top_receivers_json"))
+        out["metrics"] = ms_dict
+        out["ready"] = True
+
+    return out
+
+
+@mcp.tool()
+def top_senders(value: dict | int = 10):
+    """
+    Return top sender addresses by tx count.
+    Prefers metrics_snapshot.top_senders_json; falls back to live query over the
+    same window if snapshot is missing.
+    """
+    limit = int(value if isinstance(value, int) else _get(value, "limit", 10))
+    limit = max(1, min(limit, 500))
+
+    ms = db.execute("SELECT window_n_blocks, to_block, top_senders_json FROM metrics_snapshot WHERE id=1").fetchone()
+    if ms and ms["top_senders_json"]:
+        arr = json.loads(ms["top_senders_json"])
+        return arr[:limit]
+
+    # fallback: compute from txs over the last window if we have block bounds
+    if ms:
+        to_block = ms["to_block"]
+        from_block = max(0, to_block - int(ms["window_n_blocks"]) + 1)
+        rows = db.execute("""
+            SELECT "from" AS address, COUNT(*) AS count
+            FROM txs
+            WHERE block_number BETWEEN ? AND ?
+            GROUP BY "from"
+            ORDER BY count DESC
+            LIMIT ?
+        """, (from_block, to_block, limit)).fetchall()
+        return [row_to_dict(r) for r in rows]
+
+    # final fallback: all-time top senders
+    rows = db.execute("""
+        SELECT "from" AS address, COUNT(*) AS count
+        FROM txs
+        GROUP BY "from"
+        ORDER BY count DESC
+        LIMIT ?
+    """, (limit,)).fetchall()
+    return [row_to_dict(r) for r in rows]
+
+
+@mcp.tool()
+def top_receivers(value: dict | int = 10):
+    """
+    Return top receiver addresses by tx count.
+    Prefers metrics_snapshot.top_receivers_json; falls back to live query over the
+    same window if snapshot is missing.
+    """
+    limit = int(value if isinstance(value, int) else _get(value, "limit", 10))
+    limit = max(1, min(limit, 500))
+
+    ms = db.execute("SELECT window_n_blocks, to_block, top_receivers_json FROM metrics_snapshot WHERE id=1").fetchone()
+    if ms and ms["top_receivers_json"]:
+        arr = json.loads(ms["top_receivers_json"])
+        return arr[:limit]
+
+    # fallback: compute from txs over the last window if we have block bounds
+    if ms:
+        to_block = ms["to_block"]
+        from_block = max(0, to_block - int(ms["window_n_blocks"]) + 1)
+        rows = db.execute("""
+            SELECT "to" AS address, COUNT(*) AS count
+            FROM txs
+            WHERE block_number BETWEEN ? AND ? AND "to" IS NOT NULL
+            GROUP BY "to"
+            ORDER BY count DESC
+            LIMIT ?
+        """, (from_block, to_block, limit)).fetchall()
+        return [row_to_dict(r) for r in rows]
+
+    # final fallback: all-time top receivers
+    rows = db.execute("""
+        SELECT "to" AS address, COUNT(*) AS count
+        FROM txs
+        WHERE "to" IS NOT NULL
+        GROUP BY "to"
+        ORDER BY count DESC
+        LIMIT ?
+    """, (limit,)).fetchall()
+    return [row_to_dict(r) for r in rows]
 
 
 if __name__ == "__main__":
