@@ -1,10 +1,9 @@
-# mcp_server.py
-import os
-import sqlite3
-from typing import List, Dict, Any
-
+# mcp_server.py (patched tool defs)
+import os, sqlite3
+from typing import List, Dict, Any, Optional
 from dotenv import load_dotenv
-from fastmcp import FastMCP  # ToolSpec and mcp_tool not needed in latest versions
+from fastmcp import FastMCP
+from pydantic import BaseModel, Field
 
 load_dotenv(".env")
 DB_PATH = os.getenv("DB_PATH", "katana_index.sqlite")
@@ -20,100 +19,100 @@ mcp = FastMCP("katana-index-mcp", version="0.1.0")
 def row_to_dict(row: sqlite3.Row) -> Dict[str, Any]:
     return {k: row[k] for k in row.keys()}
 
-# ----------------- Tools -----------------
+# --------- Pydantic input models ----------
+class LimitIn(BaseModel):
+    limit: int = Field(10, ge=1, le=500)
+
+class BlockQueryIn(BaseModel):
+    number: int
+    with_txs: bool = False
+    tx_sample: int = Field(20, ge=1, le=500)
+
+class TxQueryIn(BaseModel):
+    hash: str
+
+# ----------------- Tools ------------------
+
+
+# --- tool defs in mcp_server.py ---
+
+def _get(obj, key, default):
+    if isinstance(obj, dict):
+        return obj.get(key, default)
+    return default
 
 @mcp.tool()
-def latest_blocks(limit: int = 10) -> List[Dict[str, Any]]:
+def latest_blocks(value: dict | int = 10):
     """Return the latest N blocks (descending by number)."""
-    limit = max(1, min(int(limit), 500))
-    rows = db.execute(
-        """
+    limit = int(value if isinstance(value, int) else _get(value, "limit", 10))
+    limit = max(1, min(limit, 500))
+    rows = db.execute("""
         SELECT number, hash, parent_hash, timestamp, gas_limit, gas_used,
                base_fee_per_gas_wei, miner, tx_count
-        FROM blocks
-        ORDER BY number DESC
-        LIMIT ?
-        """,
-        (limit,),
-    ).fetchall()
+        FROM blocks ORDER BY number DESC LIMIT ?
+    """, (limit,)).fetchall()
     return [row_to_dict(r) for r in rows]
 
 @mcp.tool()
-def latest_txs(limit: int = 10) -> List[Dict[str, Any]]:
+def latest_txs(value: dict | int = 10):
     """Return the latest N transactions (descending by block_number, tx_index)."""
-    limit = max(1, min(int(limit), 500))
-    rows = db.execute(
-        """
+    limit = int(value if isinstance(value, int) else _get(value, "limit", 10))
+    limit = max(1, min(limit, 500))
+    rows = db.execute("""
         SELECT hash, block_number, tx_index, "from", "to", value_wei, nonce, gas,
                gas_price, max_fee_per_gas_wei, max_priority_fee_per_gas_wei,
                status, gas_used, effective_gas_price_wei, contract_address
-        FROM txs
-        ORDER BY block_number DESC, tx_index DESC
-        LIMIT ?
-        """,
-        (limit,),
-    ).fetchall()
+        FROM txs ORDER BY block_number DESC, tx_index DESC LIMIT ?
+    """, (limit,)).fetchall()
     return [row_to_dict(r) for r in rows]
 
 @mcp.tool()
-def block_by_number(number: int, with_txs: bool = False, tx_sample: int = 20) -> Dict[str, Any]:
+def block_by_number(value: dict):
     """Return a block by number (optionally with some txs)."""
-    blk = db.execute(
-        """
+    number = int(_get(value, "number", -1))
+    with_txs = bool(_get(value, "with_txs", False))
+    tx_sample = int(_get(value, "tx_sample", 20))
+    if number < 0:
+        return {"error": "number is required"}
+    blk = db.execute("""
         SELECT number, hash, parent_hash, timestamp, gas_limit, gas_used,
                base_fee_per_gas_wei, miner, tx_count
         FROM blocks WHERE number=?
-        """,
-        (number,),
-    ).fetchone()
+    """, (number,)).fetchone()
     if not blk:
         return {"error": f"block {number} not found"}
-
     out = row_to_dict(blk)
-
     if with_txs:
-        tx_sample = max(1, min(int(tx_sample), 500))
-        txs = db.execute(
-            """
+        tx_sample = max(1, min(tx_sample, 500))
+        txs = db.execute("""
             SELECT hash, tx_index, "from", "to", value_wei, status
-            FROM txs
-            WHERE block_number=?
-            ORDER BY tx_index ASC
-            LIMIT ?
-            """,
-            (number, tx_sample),
-        ).fetchall()
+            FROM txs WHERE block_number=? ORDER BY tx_index ASC LIMIT ?
+        """, (number, tx_sample)).fetchall()
         out["txs"] = [row_to_dict(r) for r in txs]
     return out
 
 @mcp.tool()
-def tx_by_hash(hash: str) -> Dict[str, Any]:
+def tx_by_hash(value: dict | str):
     """Return a transaction by its hash."""
-    h = hash.lower()
-    row = db.execute(
-        """
+    h = value if isinstance(value, str) else _get(value, "hash", "")
+    if not h:
+        return {"error": "hash is required"}
+    row = db.execute("""
         SELECT hash, block_number, tx_index, "from", "to", value_wei, nonce, gas,
                gas_price, max_fee_per_gas_wei, max_priority_fee_per_gas_wei,
                status, gas_used, effective_gas_price_wei, contract_address
-        FROM txs WHERE lower(hash)=?
-        """,
-        (h,),
-    ).fetchone()
+        FROM txs WHERE lower(hash)=lower(?)
+    """, (h,)).fetchone()
     if not row:
-        return {"error": f"tx {hash} not found"}
+        return {"error": f"tx {h} not found"}
     return row_to_dict(row)
 
-@mcp.tool()
-def health() -> Dict[str, Any]:
-    """Return simple MCP + DB health stats."""
-    blk = db.execute("SELECT MAX(number) AS max_block, COUNT(*) AS nblocks FROM blocks").fetchone()
-    tx = db.execute("SELECT COUNT(*) AS ntx, MAX(block_number) AS max_tx_block FROM txs").fetchone()
-    return {
-        "db_path": DB_PATH,
-        "blocks": {"count": blk["nblocks"], "max_number": blk["max_block"]},
-        "txs": {"count": tx["ntx"], "max_block_number": tx["max_tx_block"]},
-    }
 
 if __name__ == "__main__":
-    mcp.run(host="0.0.0.0", port=8000, transport="http")
-
+    # HTTP mode for n8n
+    # Use whichever your FastMCP version supports:
+    try:
+        mcp.run(host="0.0.0.0", port=8000, transport="http")
+    except TypeError:
+        from fastmcp import Transport
+        mcp.run(transport=Transport.HTTP, host="0.0.0.0", port=8000)
