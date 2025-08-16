@@ -1,12 +1,15 @@
 import {
   DynamicContextProvider,
-  DynamicWidget,
+  useDynamicContext,
 } from "@dynamic-labs/sdk-react-core";
 
 import { EthereumWalletConnectors } from "@dynamic-labs/ethereum";
-import { Route, Routes } from "react-router-dom";
+import { Navigate, Route, Routes } from "react-router-dom";
 import Home from "./pages/Home";
-
+import Auth from "./pages/Auth";
+import About from "./pages/About";
+import Contact from "./pages/Contact";
+import Navbar from "./components/Navbar";
 
 export default function App() {
   return (
@@ -16,12 +19,23 @@ export default function App() {
         walletConnectors: [EthereumWalletConnectors],
       }}
     >
-      <DynamicWidget />
+      <Navbar />
       <Routes>
-        
-        <Route path="/" element={<Home />} />
+        <Route path="/" element={<AuthRedirector />} />
+        <Route path="/home" element={<Home />} />
+        <Route path="/about" element={<About />} />
+        <Route path="/contact" element={<Contact />} />
+        <Route path="*" element={<Navigate to="/" replace />} />
       </Routes>
     </DynamicContextProvider>
   );
 
+}
+
+function AuthRedirector() {
+  const { user } = useDynamicContext();
+  if (user) {
+    return <Navigate to="/home" replace />;
+  }
+  return <Auth />;
 }
