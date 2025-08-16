@@ -13,7 +13,6 @@ load_dotenv(".env")  # always load from local file
 RPC_URL         = os.getenv("RPC_URL")
 CONFIRMS        = int(os.getenv("CONFIRMS", "6"))
 BACKFILL_BLOCKS = int(os.getenv("BACKFILL_BLOCKS", "5000"))
-BLOCK_BATCH     = int(os.getenv("BLOCK_BATCH", "50"))
 RECEIPT_CONC    = int(os.getenv("RECEIPT_CONC", "20"))
 DB_PATH         = os.getenv("DB_PATH", "katana_index.sqlite")
 
