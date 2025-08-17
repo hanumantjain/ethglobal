@@ -1,5 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { useDynamicContext } from '@dynamic-labs/sdk-react-core'
+import { isEthereumWallet } from '@dynamic-labs/ethereum'
+import { isAddress, parseEther } from 'viem'
 import { useNavigate } from 'react-router-dom'
 const WEBHOOK_URL = import.meta.env.VITE_N8N_WORKFLOW_OPENSEA_MPC
 
@@ -12,6 +14,92 @@ const Home = () => {
   const messagesEndRef = useRef<HTMLDivElement | null>(null)
   const sessionIdRef = useRef<string>('')
   const walletAddress = primaryWallet?.address;
+
+	// Simple state machine for send/transfer flows
+	const [awaitingField, setAwaitingField] = useState<'receiver' | 'amount' | null>(null)
+	const [pendingReceiver, setPendingReceiver] = useState<string>('')
+
+  const handleShowBalance = (text: string) => {
+    setMessages((prev) => [...prev, { role: 'assistant', content: text }])
+  }
+
+	const stripCodeFences = (text: string): string => {
+		const fenceMatch = text.match(/```[a-zA-Z]*\s*([\s\S]*?)\s*```/)
+		if (fenceMatch && fenceMatch[1]) return fenceMatch[1].trim()
+		return text.trim()
+	}
+
+	const extractJsonCandidate = (text: string): string | null => {
+		const stripped = stripCodeFences(text)
+		try {
+			JSON.parse(stripped)
+			return stripped
+		} catch {}
+		const start = stripped.indexOf('{')
+		const end = stripped.lastIndexOf('}')
+		if (start !== -1 && end !== -1 && end > start) {
+			return stripped.slice(start, end + 1).trim()
+		}
+		return null
+	}
+
+	const tryParseJson = (value: unknown): any | null => {
+		if (typeof value !== 'string') return null
+		const candidate = extractJsonCandidate(value)
+		if (!candidate) return null
+		try {
+			return JSON.parse(candidate)
+		} catch {
+			return null
+		}
+	}
+
+	const performCheckBalance = async () => {
+		try {
+			if (!primaryWallet || !(primaryWallet as any).getBalance) {
+				handleShowBalance('Balance unavailable')
+				return
+			}
+			const balance: any = await (primaryWallet as any).getBalance()
+			const symbol = typeof balance?.symbol === 'string' ? balance.symbol : 'ETH'
+			const value =
+				(typeof balance?.formatted === 'string' && balance.formatted) ||
+				(typeof balance?.balance === 'string' && balance.balance) ||
+				(typeof balance?.value === 'string' && balance.value) ||
+				(String(balance))
+			handleShowBalance(`${value} ${symbol}`)
+		} catch (e) {
+			console.error('Failed to fetch wallet balance via primaryWallet:', e)
+			handleShowBalance('Balance unavailable')
+		}
+	}
+
+	const performSendTransaction = async (toAddress: string, amountEth: string) => {
+		try {
+			if (!primaryWallet || !isEthereumWallet(primaryWallet)) {
+				setMessages((prev) => [
+					...prev,
+					{ role: 'assistant', content: 'Wallet not ready for sending transactions.' },
+				])
+				return
+			}
+			const walletClient = await (primaryWallet as any).getWalletClient()
+			const txHash = await walletClient.sendTransaction({
+				to: toAddress as `0x${string}`,
+				value: parseEther(String(amountEth)),
+			})
+			setMessages((prev) => [
+				...prev,
+				{ role: 'assistant', content: `Sent ${amountEth} ETH to ${toAddress}. Tx: ${txHash}` },
+			])
+		} catch (e: any) {
+			console.error('Failed to send transaction:', e)
+			setMessages((prev) => [
+				...prev,
+				{ role: 'assistant', content: 'Failed to send transaction. Please try again.' },
+			])
+		}
+	}
 
   useEffect(() => {
     if (!user) {
@@ -44,10 +132,51 @@ const Home = () => {
 	const handleSend = async () => {
 		const trimmed = input.trim()
 		if (!trimmed) return
-		// Add user's message and start loading
+		// Add user's message
 		setMessages((prev) => [...prev, { role: 'user', content: trimmed }])
-		setIsLoading(true)
 		setInput('')
+
+		// If we are in the middle of a send/transfer flow, handle locally and short-circuit
+		if (awaitingField) {
+			if (awaitingField === 'receiver') {
+				const candidate = trimmed
+				if (!isAddress(candidate)) {
+					setMessages((prev) => [
+						...prev,
+						{ role: 'assistant', content: 'That does not look like a valid EVM address. Please enter a valid 0x... address.' },
+					])
+					return
+				}
+				setPendingReceiver(candidate)
+				setAwaitingField('amount')
+				setMessages((prev) => [
+					...prev,
+					{ role: 'assistant', content: 'How much would you like to send? Enter the amount in ETH (e.g. 0.05).' },
+				])
+				return
+			}
+			if (awaitingField === 'amount') {
+				const candidateAmount = trimmed
+				const numeric = Number(candidateAmount)
+				if (!isFinite(numeric) || numeric <= 0) {
+					setMessages((prev) => [
+						...prev,
+						{ role: 'assistant', content: 'Please enter a valid positive number for the amount in ETH.' },
+					])
+					return
+				}
+				const toAddress = pendingReceiver
+				const amountEth = candidateAmount
+				// reset state before attempting send
+				setAwaitingField(null)
+				setPendingReceiver('')
+				await performSendTransaction(toAddress, amountEth)
+				return
+			}
+		}
+
+		// Otherwise, proceed to call the webhook
+		setIsLoading(true)
 		try {
 			const response = await fetch(WEBHOOK_URL, {
 				method: 'POST',
@@ -88,7 +217,34 @@ const Home = () => {
 			} else if (typeof data === 'string') {
 				extracted = data
 			}
-			setMessages((prev) => [...prev, { role: 'assistant', content: extracted || 'No response received.' }])
+			// Detect and execute wallet action if present (only check_balance for now)
+			let actionPayload: any | null = null
+			if (data && typeof data === 'object' && 'action' in (data as Record<string, unknown>)) {
+				actionPayload = data
+			} else {
+				const parsed = tryParseJson(extracted)
+				if (parsed && typeof parsed === 'object' && 'action' in parsed) {
+					actionPayload = parsed
+				}
+			}
+			if (actionPayload && typeof actionPayload === 'object') {
+				const action = String((actionPayload as any).action || '')
+				if (action === 'check_balance') {
+					await performCheckBalance()
+				} else if (/(send|transfer)/i.test(action)) {
+					// Initiate send flow: ask for receiver then amount
+					setAwaitingField('receiver')
+					setPendingReceiver('')
+					setMessages((prev) => [
+						...prev,
+						{ role: 'assistant', content: 'Please provide the recipient wallet address (0x...).' },
+					])
+				} else {
+					setMessages((prev) => [...prev, { role: 'assistant', content: extracted || 'No response received.' }])
+				}
+			} else {
+				setMessages((prev) => [...prev, { role: 'assistant', content: extracted || 'No response received.' }])
+			}
 		} catch (error) {
 			console.error('Error sending to webhook:', error)
 			setMessages((prev) => [...prev, { role: 'assistant', content: 'Sorry, there was an error contacting the server.' }])
@@ -144,7 +300,7 @@ const Home = () => {
 
 				{/* Input area */}
 				<div className="bg-white px-4 py-2 pb-5">
-					<div className="flex items-center gap-2 rounded-full border px-4 py-2 shadow-sm">
+						<div className="flex items-center gap-2 rounded-full border px-4 py-2 shadow-sm">
 						<input
 							type="text"
 							value={input}
