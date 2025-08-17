@@ -22,6 +22,13 @@ METRIC_WINDOW        = int(os.getenv("METRIC_WINDOW", "200"))
 TOP_K                = int(os.getenv("TOP_K", "10"))
 METRICS_EVERY_BLOCKS = int(os.getenv("METRICS_EVERY_BLOCKS", "1000"))
 
+
+# --- NFT event topics (keccak256) ---
+ERC721_TRANSFER_TOPIC0 = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
+ERC1155_TRANSFER_SINGLE = "0xc3d58168c5ae7397731d063d5bbf3d657854427343f4c083240f7aacaa2d0f62"
+# (optional) batch: ERC1155_TRANSFER_BATCH = "0x4a39dc06d4c0dbc64b70...2d0d"
+ZERO_ADDR = "0x0000000000000000000000000000000000000000"
+
 if not RPC_URL:
     raise SystemExit("Missing RPC_URL in .env")
 
@@ -39,7 +46,42 @@ def ensure_schema(conn: sqlite3.Connection):
         k TEXT PRIMARY KEY,
         v TEXT
     );
-                       
+    -- raw logs you decide to keep (optional but handy for debugging)
+    CREATE TABLE IF NOT EXISTS logs (
+    block_number INTEGER,
+    tx_hash TEXT,
+    log_index INTEGER,
+    address TEXT,             -- emitter (contract)
+    topic0 TEXT, topic1 TEXT, topic2 TEXT, topic3 TEXT,
+    data TEXT,
+    PRIMARY KEY (tx_hash, log_index)
+    );
+
+    -- normalized NFT transfers (ERC-721 + 1155 TransferSingle)
+    CREATE TABLE IF NOT EXISTS nft_transfers (
+    block_number INTEGER,
+    tx_hash TEXT,
+    log_index INTEGER,
+    collection TEXT,          -- contract address (checksum)
+    token_id TEXT,            -- 721: uint256 ; 1155: id
+    qty INTEGER DEFAULT 1,    -- 721=1 ; 1155=value
+    "from" TEXT,
+    "to"   TEXT,
+    ts INTEGER,               -- block.timestamp (denormalize for speed)
+    PRIMARY KEY (tx_hash, log_index)
+    );
+    CREATE INDEX IF NOT EXISTS idx_nft_coll ON nft_transfers(collection);
+    CREATE INDEX IF NOT EXISTS idx_nft_token ON nft_transfers(collection, token_id);
+
+    -- optional: current owner map (fast holder/unique-holder queries)
+    CREATE TABLE IF NOT EXISTS nft_owners (
+    collection TEXT,
+    token_id TEXT,
+    owner TEXT,
+    PRIMARY KEY (collection, token_id)
+    );
+    CREATE INDEX IF NOT EXISTS idx_nft_owner ON nft_owners(owner);
+
     CREATE TABLE IF NOT EXISTS metrics_snapshot (
         id INTEGER PRIMARY KEY CHECK (id=1),
         computed_at          INTEGER NOT NULL,
@@ -131,12 +173,118 @@ def upsert_metrics_snapshot(conn, payload: Dict[str, Any]):
         {", ".join([f"{k}=excluded.{k}" for k in payload.keys()])}
     """, tuple(payload.values()))
 
+def topic_to_addr(topic_hex: str) -> str:
+    # topics are 32-byte values; address is the last 20 bytes
+    return AsyncWeb3.to_checksum_address("0x" + topic_hex[-40:])
+
+def topic_to_u256(topic_hex: str) -> int:
+    return int(topic_hex, 16)
+
+def decode_1155_data(data_hex: str) -> tuple[int, int]:
+    """
+    ERC1155 TransferSingle data = abi.encode(id (uint256), value (uint256))
+    """
+    h = data_hex[2:] if data_hex.startswith("0x") else data_hex
+    if len(h) < 64*2:
+        raise ValueError("bad 1155 data length")
+    id_hex  = h[:64]
+    val_hex = h[64:128]
+    return int(id_hex, 16), int(val_hex, 16)
+
 # ----------------------- core indexer -----------------------
 async def fetch_block(w3, num):
     return await w3.eth.get_block(block_identifier=num, full_transactions=True)
 
 async def fetch_receipt(w3, tx_hash):
     return await w3.eth.get_transaction_receipt(tx_hash)
+
+async def process_nft_logs_for_block(conn, w3, block_number: int, block_ts: int):
+    # fetch only the NFT transfer topics for this block
+    logs = await w3.eth.get_logs({
+        "fromBlock": block_number,
+        "toBlock": block_number,
+        "topics": [[ERC721_TRANSFER_TOPIC0, ERC1155_TRANSFER_SINGLE]]
+    })
+
+    for lg in logs:
+        # normalize fields per log
+        addr       = AsyncWeb3.to_checksum_address(lg["address"])
+        txh        = lg["transactionHash"].hex() if hasattr(lg["transactionHash"], "hex") else str(lg["transactionHash"])
+        log_index  = int(lg["logIndex"])
+        topics     = [t.hex() if hasattr(t, "hex") else str(t) for t in lg["topics"]]
+        topic0     = topics[0].lower()
+        data_hex   = lg["data"] if isinstance(lg["data"], str) else lg["data"].hex()
+
+        # (optional) persist raw log for debugging
+        try:
+            conn.execute("""
+                INSERT OR IGNORE INTO logs
+                (block_number, tx_hash, log_index, address, topic0, topic1, topic2, topic3, data)
+                VALUES (?,?,?,?,?,?,?,?,?)
+            """, (
+                block_number, txh, log_index, addr,
+                topics[0] if len(topics) > 0 else None,
+                topics[1] if len(topics) > 1 else None,
+                topics[2] if len(topics) > 2 else None,
+                topics[3] if len(topics) > 3 else None,
+                data_hex
+            ))
+        except Exception:
+            # don't let a debug insert break indexing
+            pass
+
+        if topic0 == ERC721_TRANSFER_TOPIC0:
+            # ERC-721: topics[1]=from, [2]=to, [3]=tokenId (indexed)
+            if len(topics) < 4:
+                continue
+            from_addr = topic_to_addr(topics[1])
+            to_addr_  = topic_to_addr(topics[2])
+            token_id  = str(topic_to_u256(topics[3]))
+            qty       = 1
+
+            conn.execute("""
+                INSERT OR IGNORE INTO nft_transfers
+                (block_number, tx_hash, log_index, collection, token_id, qty, "from","to", ts)
+                VALUES (?,?,?,?,?,?,?,?,?)
+            """, (block_number, txh, log_index, addr, token_id, qty, from_addr, to_addr_, int(block_ts)))
+
+            # owners map (burn/mint/transfer)
+            if to_addr_.lower() == ZERO_ADDR:
+                conn.execute("DELETE FROM nft_owners WHERE collection=? AND token_id=?", (addr, token_id))
+            else:
+                conn.execute("""
+                    INSERT INTO nft_owners(collection, token_id, owner)
+                    VALUES(?,?,?)
+                    ON CONFLICT(collection, token_id) DO UPDATE SET owner=excluded.owner
+                """, (addr, token_id, to_addr_))
+
+        elif topic0 == ERC1155_TRANSFER_SINGLE:
+            # ERC-1155 TransferSingle: topics[1]=operator, [2]=from, [3]=to ; data encodes (id,value)
+            if len(topics) < 4:
+                continue
+            from_addr = topic_to_addr(topics[2])
+            to_addr_  = topic_to_addr(topics[3])
+            token_id_u256, qty_u256 = decode_1155_data(data_hex)
+            token_id = str(token_id_u256)
+            qty      = int(qty_u256)
+
+            conn.execute("""
+                INSERT OR IGNORE INTO nft_transfers
+                (block_number, tx_hash, log_index, collection, token_id, qty, "from","to", ts)
+                VALUES (?,?,?,?,?,?,?,?,?)
+            """, (block_number, txh, log_index, addr, token_id, qty, from_addr, to_addr_, int(block_ts)))
+
+            # simplified owner map for hackathon
+            if to_addr_.lower() == ZERO_ADDR:
+                conn.execute("DELETE FROM nft_owners WHERE collection=? AND token_id=?", (addr, token_id))
+            else:
+                conn.execute("""
+                    INSERT INTO nft_owners(collection, token_id, owner)
+                    VALUES(?,?,?)
+                    ON CONFLICT(collection, token_id) DO UPDATE SET owner=excluded.owner
+                """, (addr, token_id, to_addr_))
+        # else: ignore other topics
+
 
 
 async def index_range(conn, w3, start, end):
@@ -168,6 +316,8 @@ async def index_range(conn, w3, start, end):
             to_addr(b.get("miner") or b.get("coinbase")),
             len(b["transactions"])
         ))
+
+        await process_nft_logs_for_block(conn, w3, n, int(b["timestamp"]))
 
         # ---- fetch receipts in parallel (bounded) ----
         sem = asyncio.Semaphore(RECEIPT_CONC)

@@ -221,6 +221,167 @@ def top_receivers(value: dict | int = 10):
     """, (limit,)).fetchall()
     return [row_to_dict(r) for r in rows]
 
+@mcp.tool()
+def recent_nft_transfers(value: dict | int = 20):
+    """
+    Return the most recent NFT transfers (ERC-721 + ERC-1155 Single).
+    Optional: { "limit": 20, "collection": "0x..." }
+    """
+    limit = int(value if isinstance(value, int) else _get(value, "limit", 20))
+    limit = max(1, min(limit, 500))
+
+    coll = None if isinstance(value, int) else _get(value, "collection", None)
+    if coll:
+        rows = db.execute("""
+            SELECT block_number, tx_hash, log_index, collection, token_id, qty, "from", "to", ts
+            FROM nft_transfers
+            WHERE lower(collection)=lower(?)
+            ORDER BY block_number DESC, log_index ASC
+            LIMIT ?
+        """, (coll, limit)).fetchall()
+    else:
+        rows = db.execute("""
+            SELECT block_number, tx_hash, log_index, collection, token_id, qty, "from", "to", ts
+            FROM nft_transfers
+            ORDER BY block_number DESC, log_index ASC
+            LIMIT ?
+        """, (limit,)).fetchall()
+
+    return [row_to_dict(r) for r in rows]
+
+@mcp.tool()
+def top_collections(value: dict | int = 10):
+    """
+    Top NFT collections by transfer count in the last window.
+    Args: { "limit": 10, "window_hours": 24 }
+    """
+    limit = int(value if isinstance(value, int) else _get(value, "limit", 10))
+    limit = max(1, min(limit, 200))
+    window_hours = 24 if isinstance(value, int) else int(_get(value, "window_hours", 24))
+    window_secs = max(1, window_hours) * 3600
+
+    rows = db.execute("""
+        WITH now(cur_ts) AS (SELECT strftime('%s','now'))
+        SELECT nt.collection,
+               COUNT(*) AS transfers,
+               SUM(nt.qty) AS units,
+               COUNT(DISTINCT nt."from") + COUNT(DISTINCT nt."to") AS participants
+        FROM nft_transfers AS nt, now
+        WHERE nt.ts >= now.cur_ts - ?
+        GROUP BY nt.collection
+        ORDER BY transfers DESC
+        LIMIT ?
+    """, (window_secs, limit)).fetchall()
+
+    return [row_to_dict(r) for r in rows]
+
+
+@mcp.tool()
+def nft_trending(value: dict | int = 20):
+    """
+    Trending NFTs by activity in the last window.
+    Args: { "limit": 20, "window_hours": 6 }
+    Returns: collection, token_id, tx_count, actor_count
+    """
+    limit = int(value if isinstance(value, int) else _get(value, "limit", 20))
+    limit = max(1, min(limit, 200))
+    window_hours = 6 if isinstance(value, int) else int(_get(value, "window_hours", 6))
+    window_secs = max(1, window_hours) * 3600
+
+    rows = db.execute("""
+        WITH now(cur_ts) AS (SELECT strftime('%s','now'))
+        SELECT nt.collection,
+               nt.token_id,
+               COUNT(*) AS tx_count,
+               (COUNT(DISTINCT nt."from") + COUNT(DISTINCT nt."to")) AS actor_count
+        FROM nft_transfers AS nt, now
+        WHERE nt.ts >= now.cur_ts - ?
+        GROUP BY nt.collection, nt.token_id
+        ORDER BY tx_count DESC, actor_count DESC
+        LIMIT ?
+    """, (window_secs, limit)).fetchall()
+
+    return [row_to_dict(r) for r in rows]
+
+
+@mcp.tool()
+def unique_holders(value: dict | str):
+    """
+    Unique holders for a collection.
+    Args: { "collection": "0x..." }  OR just the collection string
+    """
+    coll = value if isinstance(value, str) else _get(value, "collection", "")
+    if not coll:
+        return {"error": "collection is required"}
+
+    row = db.execute("""
+        SELECT COUNT(*) AS unique_holders
+        FROM nft_owners
+        WHERE lower(collection)=lower(?)
+    """, (coll,)).fetchone()
+
+    return {"collection": coll, "unique_holders": row["unique_holders"] if row else 0}
+
+@mcp.tool()
+def holders_top5_share(value: dict | str):
+    """
+    Top-5 owner concentration (share of tokens) for a collection.
+    Args: { "collection": "0x..." } OR string
+    Note: uses simplified owner map (one owner per token_id).
+    """
+    coll = value if isinstance(value, str) else _get(value, "collection", "")
+    if not coll:
+        return {"error": "collection is required"}
+
+    # tokens per owner
+    owners = db.execute("""
+        SELECT owner, COUNT(*) AS tokens
+        FROM nft_owners
+        WHERE lower(collection)=lower(?)
+        GROUP BY owner
+        ORDER BY tokens DESC
+    """, (coll,)).fetchall()
+
+    if not owners:
+        return {"collection": coll, "top5_share": None, "owners": []}
+
+    total = sum(r["tokens"] for r in owners)
+    top5  = sum(r["tokens"] for r in owners[:5])
+    share = (top5 / total) if total else None
+
+    return {
+        "collection": coll,
+        "top5_share": share,
+        "owners": [row_to_dict(r) for r in owners[:5]]
+    }
+
+@mcp.tool()
+def top_owners(value: dict | str):
+    """
+    Top owners by token count for a collection.
+    Args: { "collection": "0x...", "limit": 10 } OR string
+    """
+    if isinstance(value, str):
+        coll = value
+        limit = 10
+    else:
+        coll = _get(value, "collection", "")
+        limit = int(_get(value, "limit", 10))
+    if not coll:
+        return {"error": "collection is required"}
+    limit = max(1, min(limit, 200))
+
+    rows = db.execute("""
+        SELECT owner, COUNT(*) AS tokens
+        FROM nft_owners
+        WHERE lower(collection)=lower(?)
+        GROUP BY owner
+        ORDER BY tokens DESC
+        LIMIT ?
+    """, (coll, limit)).fetchall()
+
+    return [row_to_dict(r) for r in rows]
+
 
 if __name__ == "__main__":
     # HTTP mode for n8n
