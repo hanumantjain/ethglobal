@@ -6,7 +6,7 @@ import mcp_tools_wrappers  # noqa: F401
 
 if __name__ == "__main__":
     try:
-        mcp.run(host="0.0.0.0", port=8000, transport="http")
+        mcp.run(host="0.0.0.0", port=8001, transport="http")
     except TypeError:
         from fastmcp import Transport
-        mcp.run(transport=Transport.HTTP, host="0.0.0.0", port=8000)
+        mcp.run(transport=Transport.HTTP, host="0.0.0.0", port=8001)

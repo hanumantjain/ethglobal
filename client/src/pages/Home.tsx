@@ -255,9 +255,9 @@ const Home = () => {
 
 	return (
 		<>
-		<div className="flex min-h-screen flex-col pt-20">
+		<div className="flex h-screen flex-col pt-20 overflow-hidden">
 			{/* Parent wrapper containing message area and input area */}
-			<div className="mx-auto w-full max-w-3xl flex flex-col flex-1">
+			<div className="mx-auto w-full max-w-3xl flex flex-col flex-1 overflow-hidden">
 				{/* Message area */}
 				<div className="flex-1 overflow-y-auto px-4 py-4">
 					<div className="space-y-3">
