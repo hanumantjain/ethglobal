@@ -1,0 +1,5 @@
+[
+  { "name": "IMORPHO", "address": "0x1e5eFCA3D0dB2c6d5C67a4491845c43253eB9e4e", "type": "erc20" },
+  { "name": "IYFI",    "address": "0x476eaCd417cD65421bD34fca054377658BB5E02b", "type": "erc20" },
+  { "name": "IbvbUSDC","address": "0x203A662b0BD271A6ed5a60EdFbd04bFce608FD36", "type": "erc20" }
+]

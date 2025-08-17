@@ -3,10 +3,10 @@ import sqlite3
 import os
 import uvloop
 from dotenv import load_dotenv
-from web3 import AsyncWeb3
+from web3 import AsyncWeb3, Web3
 from web3.providers.async_rpc import AsyncHTTPProvider
 from web3.types import HexBytes
-
+import pathlib
 import json, time
 from typing import List, Dict, Any
 
@@ -32,6 +32,28 @@ ZERO_ADDR = "0x0000000000000000000000000000000000000000"
 if not RPC_URL:
     raise SystemExit("Missing RPC_URL in .env")
 
+# Import smart contract watchlist
+CONTRACTS_PATH = os.getenv("CONTRACTS_PATH", "contracts.json")
+CONTRACTS = []
+p = pathlib.Path(CONTRACTS_PATH)
+if p.exists():
+    try:
+        CONTRACTS = json.loads(p.read_text())
+    except Exception as e:
+        print(f"[contracts] failed to parse {CONTRACTS_PATH}: {e}")
+else:
+    print(f"[contracts] {CONTRACTS_PATH} not found; continuing without contract watchlist")
+
+# normalize & cache the addresses we will watch
+WATCH_ERC20 = []
+for c in CONTRACTS:
+    if (c.get("type") or "").lower() == "erc20":
+        try:
+            WATCH_ERC20.append(Web3.to_checksum_address(c["address"]))
+        except Exception:
+            pass
+WATCH_ERC20_LOWER = {a.lower() for a in WATCH_ERC20}
+
 # ----------------------- DB schema helpers -----------------------
 def db():
     conn = sqlite3.connect(DB_PATH, isolation_level=None, check_same_thread=False)
@@ -46,6 +68,41 @@ def ensure_schema(conn: sqlite3.Connection):
         k TEXT PRIMARY KEY,
         v TEXT
     );
+                       
+        -- known contracts (optional metadata cache)
+    CREATE TABLE IF NOT EXISTS contracts (
+      address TEXT PRIMARY KEY,
+      name    TEXT,
+      type    TEXT
+    );
+
+    -- ERC20 transfers (fast path)
+    CREATE TABLE IF NOT EXISTS erc20_transfers (
+      block_number INTEGER,
+      tx_hash      TEXT,
+      log_index    INTEGER,
+      token        TEXT,            -- contract address
+      "from"       TEXT,
+      "to"         TEXT,
+      value_wei    TEXT,            -- as decimal string
+      ts           INTEGER,
+      PRIMARY KEY (tx_hash, log_index)
+    );
+    CREATE INDEX IF NOT EXISTS idx_erc20_token_ts ON erc20_transfers(token, ts);
+    CREATE INDEX IF NOT EXISTS idx_erc20_from ON erc20_transfers("from");
+    CREATE INDEX IF NOT EXISTS idx_erc20_to   ON erc20_transfers("to");
+
+    -- lightweight token meta cache (filled via eth_call on demand)
+    CREATE TABLE IF NOT EXISTS erc20_meta (
+      token           TEXT PRIMARY KEY,
+      name            TEXT,
+      symbol          TEXT,
+      decimals        INTEGER,
+      total_supply_wei TEXT,
+      updated_at      INTEGER
+    );
+                       
+
     -- raw logs you decide to keep (optional but handy for debugging)
     CREATE TABLE IF NOT EXISTS logs (
     block_number INTEGER,
@@ -198,6 +255,55 @@ async def fetch_block(w3, num):
 async def fetch_receipt(w3, tx_hash):
     return await w3.eth.get_transaction_receipt(tx_hash)
 
+# --- ERC-20 topics ---
+ERC20_TRANSFER_TOPIC0 = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef"
+ERC20_APPROVAL_TOPIC0 = "0x8c5be1e5ebec7d5bd14f71427d1e84f3dd0314c0f7b2291e5b200ac8c7c3b925"
+
+def topic_to_address_from_32b(t: str) -> str:
+    return AsyncWeb3.to_checksum_address("0x" + t[-40:])
+
+async def process_erc20_logs_for_block(conn, w3, block_number: int, block_ts: int):
+    if not WATCH_ERC20:
+        return
+
+    # Pull logs for this block scoped to watched addresses
+    logs = await w3.eth.get_logs({
+        "fromBlock": block_number,
+        "toBlock": block_number,
+        "address": WATCH_ERC20
+    })
+
+    for lg in logs:
+        addr      = AsyncWeb3.to_checksum_address(lg["address"])
+        txh       = lg["transactionHash"].hex() if hasattr(lg["transactionHash"], "hex") else str(lg["transactionHash"])
+        log_index = int(lg["logIndex"])
+        topics    = [t.hex() if hasattr(t, "hex") else str(t) for t in lg["topics"]]
+        if not topics:
+            continue
+        topic0 = topics[0].lower()
+        data_hex = lg["data"] if isinstance(lg["data"], str) else lg["data"].hex()
+
+        # Decode known ERC-20 events
+        if topic0 == ERC20_TRANSFER_TOPIC0 and len(topics) >= 3:
+            from_addr = topic_to_address_from_32b(topics[1])
+            to_addr   = topic_to_address_from_32b(topics[2])
+            # data is uint256 value
+            h = data_hex[2:] if data_hex.startswith("0x") else data_hex
+            value_int = int(h or "0", 16)
+            conn.execute("""
+                INSERT OR IGNORE INTO erc20_transfers
+                (block_number, tx_hash, log_index, token, "from", "to", value_wei, ts)
+                VALUES (?,?,?,?,?,?,?,?)
+            """, (block_number, txh, log_index, addr, from_addr, to_addr, str(value_int), int(block_ts)))
+
+        # You can store approvals as needed, but not necessary for first insights
+        # elif topic0 == ERC20_APPROVAL_TOPIC0 and len(topics) >= 3:
+        #     owner = topic_to_address_from_32b(topics[1])
+        #     spender = topic_to_address_from_32b(topics[2])
+        #     value = int((data_hex[2:] if data_hex.startswith("0x") else data_hex) or "0", 16)
+        #     # (optional) store in a table if you care about allowances
+
+
 async def process_nft_logs_for_block(conn, w3, block_number: int, block_ts: int):
     # fetch only the NFT transfer topics for this block
     logs = await w3.eth.get_logs({
@@ -318,7 +424,8 @@ async def index_range(conn, w3, start, end):
         ))
 
         await process_nft_logs_for_block(conn, w3, n, int(b["timestamp"]))
-
+        await process_nft_logs_for_block(conn, w3, n, int(b["timestamp"]))
+        await process_erc20_logs_for_block(conn, w3, n, int(b["timestamp"]))
         # ---- fetch receipts in parallel (bounded) ----
         sem = asyncio.Semaphore(RECEIPT_CONC)
 
@@ -484,6 +591,19 @@ def compute_metrics(conn, window_blocks: int = 200, top_k: int = 10):
     upsert_metrics_snapshot(conn, payload)
 
 
+def seed_contracts(conn):
+    for c in CONTRACTS:
+        try:
+            addr = Web3.to_checksum_address(c["address"])
+        except Exception:
+            continue
+        conn.execute("""
+            INSERT INTO contracts(address, name, type)
+            VALUES(?,?,?)
+            ON CONFLICT(address) DO UPDATE SET name=excluded.name, type=excluded.type
+        """, (addr, c.get("name") or addr, c.get("type") or "unknown"))
+
+
 async def main():
     w3 = AsyncWeb3(AsyncHTTPProvider(RPC_URL))
     latest = await w3.eth.block_number
@@ -491,6 +611,7 @@ async def main():
 
     conn = db()
     ensure_schema(conn)
+    seed_contracts(conn)
 
     last_safe = int(get_meta(conn, "last_safe_block", "-1"))
     if last_safe < 0:

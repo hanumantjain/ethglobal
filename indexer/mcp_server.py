@@ -34,7 +34,6 @@ class TxQueryIn(BaseModel):
 
 # ----------------- Tools ------------------
 
-
 # --- tool defs in mcp_server.py ---
 
 def _get(obj, key, default):
@@ -140,7 +139,6 @@ def health(value: dict | None = None):
 
     return out
 
-
 @mcp.tool()
 def top_senders(value: dict | int = 10):
     """
@@ -156,7 +154,6 @@ def top_senders(value: dict | int = 10):
         arr = json.loads(ms["top_senders_json"])
         return arr[:limit]
 
-    # fallback: compute from txs over the last window if we have block bounds
     if ms:
         to_block = ms["to_block"]
         from_block = max(0, to_block - int(ms["window_n_blocks"]) + 1)
@@ -170,7 +167,6 @@ def top_senders(value: dict | int = 10):
         """, (from_block, to_block, limit)).fetchall()
         return [row_to_dict(r) for r in rows]
 
-    # final fallback: all-time top senders
     rows = db.execute("""
         SELECT "from" AS address, COUNT(*) AS count
         FROM txs
@@ -179,7 +175,6 @@ def top_senders(value: dict | int = 10):
         LIMIT ?
     """, (limit,)).fetchall()
     return [row_to_dict(r) for r in rows]
-
 
 @mcp.tool()
 def top_receivers(value: dict | int = 10):
@@ -196,7 +191,6 @@ def top_receivers(value: dict | int = 10):
         arr = json.loads(ms["top_receivers_json"])
         return arr[:limit]
 
-    # fallback: compute from txs over the last window if we have block bounds
     if ms:
         to_block = ms["to_block"]
         from_block = max(0, to_block - int(ms["window_n_blocks"]) + 1)
@@ -210,7 +204,6 @@ def top_receivers(value: dict | int = 10):
         """, (from_block, to_block, limit)).fetchall()
         return [row_to_dict(r) for r in rows]
 
-    # final fallback: all-time top receivers
     rows = db.execute("""
         SELECT "to" AS address, COUNT(*) AS count
         FROM txs
@@ -275,7 +268,6 @@ def top_collections(value: dict | int = 10):
 
     return [row_to_dict(r) for r in rows]
 
-
 @mcp.tool()
 def nft_trending(value: dict | int = 20):
     """
@@ -302,7 +294,6 @@ def nft_trending(value: dict | int = 20):
     """, (window_secs, limit)).fetchall()
 
     return [row_to_dict(r) for r in rows]
-
 
 @mcp.tool()
 def unique_holders(value: dict | str):
@@ -333,7 +324,6 @@ def holders_top5_share(value: dict | str):
     if not coll:
         return {"error": "collection is required"}
 
-    # tokens per owner
     owners = db.execute("""
         SELECT owner, COUNT(*) AS tokens
         FROM nft_owners
@@ -382,6 +372,178 @@ def top_owners(value: dict | str):
 
     return [row_to_dict(r) for r in rows]
 
+@mcp.tool()
+def token_flow(value: dict | str):
+    """
+    Windowed ERC-20 flow stats for a token.
+    Args: { "token": "0x...", "window_hours": 24 } OR just token string
+    Returns: transfers, unique_senders, unique_receivers, mints, burns, total_value_wei
+    """
+    if isinstance(value, str):
+        token = value
+        window_hours = 24
+    else:
+        token = _get(value, "token", "")
+        window_hours = int(_get(value, "window_hours", 24))
+    if not token:
+        return {"error": "token is required"}
+    window_secs = max(1, window_hours) * 3600
+
+    row = db.execute("""
+        WITH now(cur_ts) AS (SELECT strftime('%s','now'))
+        SELECT
+          COUNT(*)                                                        AS transfers,
+          COUNT(DISTINCT "from")                                         AS unique_senders,
+          COUNT(DISTINCT "to")                                           AS unique_receivers,
+          SUM(CASE WHEN lower("from")='0x0000000000000000000000000000000000000000' THEN 1 ELSE 0 END) AS mints,
+          SUM(CASE WHEN lower("to")  ='0x0000000000000000000000000000000000000000' THEN 1 ELSE 0 END) AS burns,
+          COALESCE(SUM(CAST(value_wei AS INTEGER)), 0)                   AS total_value_wei
+        FROM erc20_transfers, now
+        WHERE lower(token)=lower(?) AND ts >= now.cur_ts - ?
+    """, (token, window_secs)).fetchone()
+
+    meta = db.execute("SELECT name, symbol, decimals, total_supply_wei FROM erc20_meta WHERE lower(token)=lower(?)", (token,)).fetchone()
+    out = row_to_dict(row)
+    out["token"] = token
+    if meta:
+        out["meta"] = row_to_dict(meta)
+    return out
+
+@mcp.tool()
+def token_top_holders(value: dict | str):
+    """
+    Approximate top holders by aggregating ERC-20 transfers since your index start.
+    Args: { "token": "0x...", "limit": 10 } OR just token string
+    NOTE: This is a naive net flow (in - out). It ignores initial pre-index balances.
+    """
+    if isinstance(value, str):
+        token = value
+        limit = 10
+    else:
+        token = _get(value, "token", "")
+        limit = int(_get(value, "limit", 10))
+    if not token:
+        return {"error": "token is required"}
+    limit = max(1, min(limit, 200))
+
+    rows = db.execute("""
+        WITH credits AS (
+          SELECT "to" AS addr, SUM(CAST(value_wei AS INTEGER)) AS val
+          FROM erc20_transfers
+          WHERE lower(token)=lower(?) AND lower("to")<>'0x0000000000000000000000000000000000000000'
+          GROUP BY "to"
+        ),
+        debits AS (
+          SELECT "from" AS addr, SUM(CAST(value_wei AS INTEGER)) AS val
+          FROM erc20_transfers
+          WHERE lower(token)=lower(?) AND lower("from")<>'0x0000000000000000000000000000000000000000'
+          GROUP BY "from"
+        )
+        SELECT address, SUM(val) AS net_wei FROM (
+          SELECT addr AS address, val       FROM credits
+          UNION ALL
+          SELECT addr AS address, -val      FROM debits
+        )
+        GROUP BY address
+        ORDER BY net_wei DESC
+        LIMIT ?
+    """, (token, token, limit)).fetchall()
+
+    return [row_to_dict(r) for r in rows]
+
+# ========== NEW: strongly-typed inputs for wrappers ==========
+class BlockIn(BaseModel):
+    number: int
+    with_txs: bool = False
+    tx_sample: int = Field(20, ge=1, le=500)
+
+class HashIn(BaseModel):
+    hash: str
+
+class WindowIn(BaseModel):
+    window_hours: int = Field(24, ge=1, le=24*30)
+    limit: int = Field(10, ge=1, le=500)
+
+class CollectionIn(BaseModel):
+    collection: str
+    limit: int = Field(10, ge=1, le=500)
+
+class TokenIn(BaseModel):
+    token: str
+    window_hours: int = Field(24, ge=1, le=24*30)
+    limit: int = Field(10, ge=1, le=500)
+
+# ========== NEW: typed wrapper tools (call existing tools) ==========
+@mcp.tool(name="blocks_latest")
+def blocks_latest_t(args: LimitIn):
+    """Latest N blocks."""
+    return latest_blocks(args.limit)
+
+@mcp.tool(name="txs_latest")
+def txs_latest_t(args: LimitIn):
+    """Latest N transactions."""
+    return latest_txs(args.limit)
+
+@mcp.tool(name="block_get")
+def block_get_t(args: BlockIn):
+    """Block by number (optional tx sample)."""
+    return block_by_number({"number": args.number, "with_txs": args.with_txs, "tx_sample": args.tx_sample})
+
+@mcp.tool(name="tx_get")
+def tx_get_t(args: HashIn):
+    """Transaction by hash."""
+    return tx_by_hash({"hash": args.hash})
+
+@mcp.tool(name="network_health")
+def network_health_t() -> dict:
+    """Indexer + metrics health."""
+    return health({})
+
+@mcp.tool(name="participants_top_senders")
+def participants_top_senders_t(args: LimitIn):
+    """Top senders by tx count over current window."""
+    return top_senders({"limit": args.limit})
+
+@mcp.tool(name="participants_top_receivers")
+def participants_top_receivers_t(args: LimitIn):
+    """Top receivers by tx count over current window."""
+    return top_receivers({"limit": args.limit})
+
+@mcp.tool(name="nft_top_collections")
+def nft_top_collections_t(args: WindowIn):
+    """Top NFT collections in a time window."""
+    return top_collections({"limit": args.limit, "window_hours": args.window_hours})
+
+@mcp.tool(name="nft_trending_tokens")
+def nft_trending_tokens_t(args: WindowIn):
+    """Trending NFTs (collection, token_id) in a window."""
+    return nft_trending({"limit": args.limit, "window_hours": args.window_hours})
+
+@mcp.tool(name="nft_recent")
+def nft_recent_t(args: LimitIn):
+    """Recent NFT transfers."""
+    return recent_nft_transfers({"limit": args.limit})
+
+@mcp.tool(name="nft_collection_holders")
+def nft_collection_holders_t(args: CollectionIn):
+    """Unique holders, top owners, top-5 share for a collection."""
+    uh = unique_holders({"collection": args.collection})
+    top = top_owners({"collection": args.collection, "limit": args.limit})
+    conc = holders_top5_share({"collection": args.collection})
+    return {
+        "collection": args.collection,
+        "unique_holders": uh.get("unique_holders") if isinstance(uh, dict) else uh,
+        "top_owners": top,
+        "top5_share": conc.get("top5_share") if isinstance(conc, dict) else None,
+        "owners_sample": conc.get("owners") if isinstance(conc, dict) else []
+    }
+
+@mcp.tool(name="token_flow_window")
+def token_flow_window_t(args: TokenIn):
+    """ERC-20 flow stats + top holders for a token in a window."""
+    flow = token_flow({"token": args.token, "window_hours": args.window_hours})
+    holders = token_top_holders({"token": args.token, "limit": args.limit})
+    return {"flow": flow, "top_holders": holders}
 
 if __name__ == "__main__":
     # HTTP mode for n8n
