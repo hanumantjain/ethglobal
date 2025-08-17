@@ -176,6 +176,17 @@ const Home = () => {
 		}
 
 		// Otherwise, proceed to call the webhook
+		// If user typed only a valid wallet address (not in a flow), start amount prompt locally
+		if (!awaitingField && isAddress(trimmed)) {
+			setPendingReceiver(trimmed)
+			setAwaitingField('amount')
+			setMessages((prev) => [
+				...prev,
+				{ role: 'assistant', content: 'How much would you like to send? Enter the amount in ETH (e.g. 0.05).' },
+			])
+			return
+		}
+
 		setIsLoading(true)
 		try {
 			const response = await fetch(WEBHOOK_URL, {
