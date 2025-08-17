@@ -39,3 +39,4 @@ ehthumbs.db
 Desktop.ini
 
 *.sqlite*
+__pycache__
